@@ -1,2 +1,2 @@
 # sniffer
-A simple sniffer program wrote in C
+A simple sniffer program written in C
