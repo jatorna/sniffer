@@ -6,6 +6,10 @@
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
+#include <netinet/in.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include <queue>
 
 #define MAX_PACKET_LEN 65535
@@ -18,9 +22,9 @@ struct packet_info {
 	u_char dst_ip[4];
 	u_short src_port;
 	u_short dst_port;
-	char host[100];
-	char user_agent[100];
-	char http_request[100];
+	char *host;
+	char *user_agent;
+	uint http_request;
 	time_t start_time;
 	u_int8_t protocol;
 };
@@ -39,12 +43,15 @@ pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 // Flag to indicate if the capture thread should stop
 int capture_thread_stop = 0;
 
+// Pcap connection handle
 pcap_t *handle;
 
+// Print stats function
 void print_stats() {
 	printf("Num total packets tracked: %u\n", packets_counter);
 }
 
+// Handle SIGINT signal function
 void handle_sigint(int dummy) {
 	printf("\nStopping program...\n");
 	capture_thread_stop = 1;
@@ -53,7 +60,15 @@ void handle_sigint(int dummy) {
 // Callback function for libpcap to process packets
 void process_packet(u_char *args, const struct pcap_pkthdr *header,
 		const u_char *packet) {
+
+	const struct tcphdr *tcp_header;
+	const char *http_payload;
+	int ethernet_header_size = sizeof(struct ether_header);
+	int ip_header_size = sizeof(struct ip);
+	int tcp_header_size;
+
 	struct packet_info info;
+	info.http_request = 0;
 
 	// Extract MAC addresses of source and destination
 	memcpy(info.src_mac, packet, 6);
@@ -63,41 +78,81 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header,
 	memcpy(info.src_ip, packet + 26, 4);
 	memcpy(info.dst_ip, packet + 30, 4);
 
+	// Extract ports of source and destination
+	info.src_port = ntohs(*(u_short*) (packet + 34));
+	info.dst_port = ntohs(*(u_short*) (packet + 36));
+
 	// Extract source and destination ports for TCP and UDP packets
 	if (packet[23] == IPPROTO_TCP) { // TCP packet
-		memcpy(&info.src_port, packet + 34, 2);
-		memcpy(&info.dst_port, packet + 36, 2);
 		info.protocol = IPPROTO_TCP;
 
 		// Extract Host and User-Agent strings for HTTP packets
 		if (info.src_port == 80 || info.dst_port == 80) {
-			// TODO: Extract Host and User-Agent strings
+			info.http_request = 1;
+
+			// Get TCP header
+			tcp_header = (struct tcphdr*) (packet + ethernet_header_size
+					+ ip_header_size);
+			tcp_header_size = tcp_header->th_off * 4;
+
+			// Get HTTP payload
+			http_payload = (char*) (packet + ethernet_header_size
+					+ ip_header_size + tcp_header_size);
+
+			char *host = NULL;
+			char *user_agent = NULL;
+
+			// Find Host and User-Agent strings
+			char *start = (char*) strstr((const char*) http_payload, "Host:");
+			if (start) {
+				start += 6;
+				char *end = strchr(start, '\r');
+				if (end) {
+					int size = end - start;
+					host = (char*) malloc(size + 1);
+					strncpy(host, start, size);
+					host[size] = '\0';
+				}
+			}
+
+			start = (char*) strstr((const char*) http_payload, "User-Agent:");
+			if (start) {
+				start += 12;
+				char *end = strchr(start, '\r');
+				if (end) {
+					int size = end - start;
+					user_agent = (char*) malloc(size + 1);
+					strncpy(user_agent, start, size);
+					user_agent[size] = '\0';
+				}
+			}
+
+			info.host = host;
+			info.user_agent = user_agent;
+
 		}
+
 	} else if (packet[23] == IPPROTO_UDP) { // UDP packet
-		memcpy(&info.src_port, packet + 34, 2);
-		memcpy(&info.dst_port, packet + 36, 2);
 		info.protocol = IPPROTO_UDP;
 	}
 
-	// Lock the queue mutex
+// Lock the queue mutex
 	pthread_mutex_lock(&queue_mutex);
 
-	// Add the packet information to the queue
+// Add the packet information to the queue
 //	info.start_time = time(NULL);
 	packets_counter++;
 	packet_queue.push(info);
 
-	// Signal the writing thread that there is data in the queue
+// Signal the writing thread that there is data in the queue
 	pthread_cond_signal(&queue_cond);
 
-	// Unlock the queue mutex
+// Unlock the queue mutex
 	pthread_mutex_unlock(&queue_mutex);
 
 	if (capture_thread_stop) {
 		pcap_breakloop(handle);
 	}
-
-
 }
 
 // Capture thread function to read packets from the interface or pcap file
@@ -172,8 +227,8 @@ void* writing_thread_func(void *arg) {
 			fprintf(fp, "Source Port: %d\n", info.src_port);
 			fprintf(fp, "Destination Port: %d\n", info.dst_port);
 		}
-		if (info.protocol == IPPROTO_TCP && strlen(info.http_request) > 0) {
-			fprintf(fp, "HTTP Request: %s\n", info.http_request);
+		if (info.protocol == IPPROTO_TCP && info.http_request) {
+			fprintf(fp, "HTTP Request\n");
 			fprintf(fp, "Host: %s\n", info.host);
 			fprintf(fp, "User Agent: %s\n", info.user_agent);
 		}
@@ -231,7 +286,7 @@ int main(int argc, char *argv[]) {
 	capture_thread_stop = 1;
 
 //// Signal the queue condition variable
-//	pthread_cond_signal(&queue_cond);
+	pthread_cond_signal(&queue_cond);
 
 // Wait for the writing thread to finish
 	if (pthread_join(writing_thread, NULL)) {
@@ -245,7 +300,6 @@ int main(int argc, char *argv[]) {
 
 	print_stats();
 	printf("##### Sniffer program finished!! #####\n");
-
 
 	return 0;
 }
