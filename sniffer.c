@@ -10,9 +10,69 @@
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <time.h>
+#include <stdbool.h>
 #include <queue>
 
 #define MAX_PACKET_LEN 65535
+#define MAX_CONNECTIONS 10000
+
+struct connection {
+	uint32_t saddr; // source IP address
+	uint16_t sport; // source port
+	uint32_t daddr; // destination IP address
+	uint16_t dport; // destination port
+	int packets_in; // number of incoming packets
+	int packets_out; // number of outgoing packets
+	long long int start_time; // connection start time
+};
+
+struct hashmap {
+	int size;
+	struct connection *connections;
+};
+
+// hash function
+int hash_func(struct connection *conn, int size) {
+	int hash_val = ((conn->saddr ^ conn->sport) + (conn->daddr ^ conn->dport))
+			% size;
+	return hash_val;
+}
+
+// insert a new connection into the hash map
+void hashmap_insert(struct hashmap *map, struct connection *conn) {
+	int hash_val = hash_func(conn, map->size);
+	while (map->connections[hash_val].saddr != 0
+			&& map->connections[hash_val].sport != 0
+			&& map->connections[hash_val].daddr != 0
+			&& map->connections[hash_val].dport != 0) {
+		hash_val = (hash_val + 1) % map->size;
+	}
+	map->connections[hash_val] = *conn;
+}
+
+// find a connection in the hash map
+struct connection* hashmap_find(struct hashmap *map, uint32_t saddr,
+		uint16_t sport, uint32_t daddr, uint16_t dport) {
+	struct connection *conn = NULL;
+	int hash_val = ((saddr ^ sport) + (daddr ^ dport)) % map->size;
+	while (map->connections[hash_val].saddr != 0
+			&& map->connections[hash_val].sport != 0
+			&& map->connections[hash_val].daddr != 0
+			&& map->connections[hash_val].dport != 0) {
+		if (map->connections[hash_val].saddr == saddr
+				&& map->connections[hash_val].sport == sport
+				&& map->connections[hash_val].daddr == daddr
+				&& map->connections[hash_val].dport == dport) {
+			conn = &map->connections[hash_val];
+			break;
+		}
+		hash_val = (hash_val + 1) % map->size;
+	}
+	return conn;
+}
 
 // Structure to store packet information
 struct packet_info {
@@ -32,7 +92,7 @@ struct packet_info {
 unsigned int packets_counter;
 
 // Queue to store packet information
-std::queue<struct packet_info> packet_queue;
+std::queue<struct connection*> packet_queue;
 
 // Mutex for queue synchronization
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -46,11 +106,6 @@ int capture_thread_stop = 0;
 // Pcap connection handle
 pcap_t *handle;
 
-// Print stats function
-void print_stats() {
-	printf("Num total packets tracked: %u\n", packets_counter);
-}
-
 // Handle SIGINT signal function
 void handle_sigint(int dummy) {
 	printf("\nStopping program...\n");
@@ -61,93 +116,89 @@ void handle_sigint(int dummy) {
 void process_packet(u_char *args, const struct pcap_pkthdr *header,
 		const u_char *packet) {
 
-	const struct tcphdr *tcp_header;
+	struct hashmap *map = (struct hashmap*) args;
+
+	struct iphdr *ip_header = (struct iphdr*) (packet
+			+ sizeof(struct ether_header));
+	struct tcphdr *tcp_header = (struct tcphdr*) (packet
+			+ sizeof(struct ether_header) + (ip_header->ihl * 4));
+	uint32_t saddr = ntohl(ip_header->saddr);
+	uint16_t sport = ntohs(tcp_header->source);
+	uint32_t daddr = ntohl(ip_header->daddr);
+	uint16_t dport = ntohs(tcp_header->dest);
+	long long int current_time = time(0);
 	const char *http_payload;
-	int ethernet_header_size = sizeof(struct ether_header);
 	int ip_header_size = sizeof(struct ip);
 	int tcp_header_size;
 
-	struct packet_info info;
-	info.http_request = 0;
-
-	// Extract MAC addresses of source and destination
-	memcpy(info.src_mac, packet, 6);
-	memcpy(info.dst_mac, packet + 6, 6);
-
-	// Extract IP addresses of source and destination
-	memcpy(info.src_ip, packet + 26, 4);
-	memcpy(info.dst_ip, packet + 30, 4);
-
-	// Extract ports of source and destination
-	info.src_port = ntohs(*(u_short*) (packet + 34));
-	info.dst_port = ntohs(*(u_short*) (packet + 36));
-
-	// Extract source and destination ports for TCP and UDP packets
-	if (packet[23] == IPPROTO_TCP) { // TCP packet
-		info.protocol = IPPROTO_TCP;
-
-		// Extract Host and User-Agent strings for HTTP packets
-		if (info.src_port == 80 || info.dst_port == 80) {
-			info.http_request = 1;
-
-			// Get TCP header
-			tcp_header = (struct tcphdr*) (packet + ethernet_header_size
-					+ ip_header_size);
-			tcp_header_size = tcp_header->th_off * 4;
-
-			// Get HTTP payload
-			http_payload = (char*) (packet + ethernet_header_size
-					+ ip_header_size + tcp_header_size);
-
-			char *host = NULL;
-			char *user_agent = NULL;
-
-			// Find Host and User-Agent strings
-			char *start = (char*) strstr((const char*) http_payload, "Host:");
-			if (start) {
-				start += 6;
-				char *end = strchr(start, '\r');
-				if (end) {
-					int size = end - start;
-					host = (char*) malloc(size + 1);
-					strncpy(host, start, size);
-					host[size] = '\0';
-				}
-			}
-
-			start = (char*) strstr((const char*) http_payload, "User-Agent:");
-			if (start) {
-				start += 12;
-				char *end = strchr(start, '\r');
-				if (end) {
-					int size = end - start;
-					user_agent = (char*) malloc(size + 1);
-					strncpy(user_agent, start, size);
-					user_agent[size] = '\0';
-				}
-			}
-
-			info.host = host;
-			info.user_agent = user_agent;
-
-		}
-
-	} else if (packet[23] == IPPROTO_UDP) { // UDP packet
-		info.protocol = IPPROTO_UDP;
+	// check if the packet is a TCP packet
+	if (ip_header->protocol != IPPROTO_TCP) {
+		return;
 	}
 
-// Lock the queue mutex
+	// check if the packet is a SYN packet (i.e., a new connection)
+	if (tcp_header->syn == 1 && tcp_header->ack == 0) {
+		struct connection conn = { .saddr = saddr, .sport = sport, .daddr =
+				daddr, .dport = dport, .packets_in = 0, .packets_out = 0,
+				.start_time = current_time };
+		hashmap_insert(map, &conn);
+	}
+
+	// find the connection in the hash map
+	struct connection *conn = hashmap_find(map, saddr, sport, daddr, dport);
+	if (conn == NULL) {
+		return;
+	}
+
+	// count the packet
+	if (saddr == conn->saddr && sport == conn->sport) {
+		conn->packets_out++;
+	} else {
+		conn->packets_in++;
+	}
+
+//	if (conn->dport == 80 || conn->sport == 80) {
+//		// Get TCP header
+//		tcp_header = (struct tcphdr*) (packet + ethernet_header_size
+//				+ ip_header_size);
+//		tcp_header_size = tcp_header->th_off * 4;
+//
+//		// Get HTTP payload
+//		http_payload = (char*) (packet + ethernet_header_size + ip_header_len
+//				+ tcp_header_size);
+//
+//	}
+
+	// check if the connection is closed
+	if (tcp_header->fin == 1) {
+		printf(
+				"Connection %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u closed after %d seconds, %d packets in, %d packets out\n",
+				(conn->saddr >> 24) & 0xff, (conn->saddr >> 16) & 0xff,
+				(conn->saddr >> 8) & 0xff, conn->saddr & 0xff, conn->sport,
+				(conn->daddr >> 24) & 0xff, (conn->daddr >> 16) & 0xff,
+				(conn->daddr >> 8) & 0xff, conn->daddr & 0xff, conn->dport,
+				(int) (current_time - conn->start_time), conn->packets_in,
+				conn->packets_out);
+
+		// remove the connection from the hash map
+		conn->saddr = 0;
+		conn->sport = 0;
+		conn->daddr = 0;
+		conn->dport = 0;
+		conn->packets_in = 0;
+		conn->packets_out = 0;
+		conn->start_time = 0;
+	}
+
+	// Lock the queue mutex
 	pthread_mutex_lock(&queue_mutex);
+	// Add the packet information to the queue
+	packet_queue.push(conn);
 
-// Add the packet information to the queue
-//	info.start_time = time(NULL);
-	packets_counter++;
-	packet_queue.push(info);
-
-// Signal the writing thread that there is data in the queue
+	// Signal the writing thread that there is data in the queue
 	pthread_cond_signal(&queue_cond);
 
-// Unlock the queue mutex
+	// Unlock the queue mutex
 	pthread_mutex_unlock(&queue_mutex);
 
 	if (capture_thread_stop) {
@@ -160,7 +211,19 @@ void* capture_thread_func(void *arg) {
 	char *device = (char*) arg;
 	char error_buffer[PCAP_ERRBUF_SIZE];
 
-// Open the device or pcap file for capturing
+	// initialize the hash map
+	struct hashmap connections_map = { .size = MAX_CONNECTIONS, .connections =
+			(struct connection*) malloc(
+					sizeof(struct connection) * MAX_CONNECTIONS) };
+
+	if (connections_map.connections == NULL) {
+		perror("Failed to allocate memory for connections array");
+		return NULL;
+	}
+	memset(connections_map.connections, 0,
+			sizeof(struct connection) * connections_map.size);
+
+	// Open the device or pcap file for capturing
 	if (strstr(device, ".pcap")) {
 		handle = pcap_open_offline(device, error_buffer);
 	} else {
@@ -171,11 +234,13 @@ void* capture_thread_func(void *arg) {
 		return NULL;
 	}
 
-// Start capturing packets
-	pcap_loop(handle, -1, process_packet, NULL);
+	// Start capturing packets
+	pcap_loop(handle, -1, process_packet, (u_char*) &connections_map);
 
-// Close the handle
+	// Close the handle
 	pcap_close(handle);
+	// cleanup
+	free(connections_map.connections);
 
 	return NULL;
 }
@@ -185,7 +250,7 @@ void* writing_thread_func(void *arg) {
 	char *filename = (char*) arg;
 	FILE *fp;
 
-// Open the text file for writing
+	// Open the text file for writing
 	fp = fopen(filename, "w");
 	if (fp == NULL) {
 		fprintf(stderr, "Couldn't open file %s for writing\n", filename);
@@ -193,49 +258,37 @@ void* writing_thread_func(void *arg) {
 	}
 
 	while (1) {
-// Lock the queue mutex
+		// Lock the queue mutex
 		pthread_mutex_lock(&queue_mutex);
-// Wait for the queue to have data
+		// Wait for the queue to have data
 		while (packet_queue.empty() && !capture_thread_stop) {
 			pthread_cond_wait(&queue_cond, &queue_mutex);
 		}
 
-// If the capture thread has stopped and the queue is empty, break the loop
+		// If the capture thread has stopped and the queue is empty, break the loop
 		if (capture_thread_stop && packet_queue.empty()) {
 			break;
 		}
 
-// Get the packet information from the front of the queue
-		struct packet_info info = packet_queue.front();
+		// Get the packet information from the front of the queue
+		struct connection *conn = packet_queue.front();
 		packet_queue.pop();
 
-// Unlock the queue mutex
+		// Unlock the queue mutex
 		pthread_mutex_unlock(&queue_mutex);
-
-// Write the packet information to the text file
-		fprintf(fp, "Source MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-				info.src_mac[0], info.src_mac[1], info.src_mac[2],
-				info.src_mac[3], info.src_mac[4], info.src_mac[5]);
-		fprintf(fp, "Destination MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-				info.dst_mac[0], info.dst_mac[1], info.dst_mac[2],
-				info.dst_mac[3], info.dst_mac[4], info.dst_mac[5]);
-		fprintf(fp, "Source IP: %d.%d.%d.%d\n", info.src_ip[0], info.src_ip[1],
-				info.src_ip[2], info.src_ip[3]);
-		fprintf(fp, "Destination IP: %d.%d.%d.%d\n", info.dst_ip[0],
-				info.dst_ip[1], info.dst_ip[2], info.dst_ip[3]);
-		if (info.protocol == IPPROTO_TCP || info.protocol == IPPROTO_UDP) {
-			fprintf(fp, "Source Port: %d\n", info.src_port);
-			fprintf(fp, "Destination Port: %d\n", info.dst_port);
-		}
-		if (info.protocol == IPPROTO_TCP && info.http_request) {
-			fprintf(fp, "HTTP Request\n");
-			fprintf(fp, "Host: %s\n", info.host);
-			fprintf(fp, "User Agent: %s\n", info.user_agent);
-		}
+		// Write the packet information to the text file
+		fprintf(fp,
+				"Connection %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u closed after %d seconds, %d packets in, %d packets out\n",
+				(conn->saddr >> 24) & 0xff, (conn->saddr >> 16) & 0xff,
+				(conn->saddr >> 8) & 0xff, conn->saddr & 0xff, conn->sport,
+				(conn->daddr >> 24) & 0xff, (conn->daddr >> 16) & 0xff,
+				(conn->daddr >> 8) & 0xff, conn->daddr & 0xff, conn->dport,
+				(int) (time(0) - conn->start_time), conn->packets_in,
+				conn->packets_out);
 		fprintf(fp, "\n");
 	}
 
-// Close the text file
+	// Close the text file
 	fclose(fp);
 
 	return NULL;
@@ -298,7 +351,6 @@ int main(int argc, char *argv[]) {
 	pthread_mutex_destroy(&queue_mutex);
 	pthread_cond_destroy(&queue_cond);
 
-	print_stats();
 	printf("##### Sniffer program finished!! #####\n");
 
 	return 0;
