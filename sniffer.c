@@ -4,7 +4,6 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <time.h>
 #include <signal.h>
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
