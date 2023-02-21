@@ -26,7 +26,11 @@ struct connection {
 	uint16_t dport; // destination port
 	int packets_in; // number of incoming packets
 	int packets_out; // number of outgoing packets
-	long long int start_time; // connection start time
+	char *host; // http host
+	char *user_agent; // http user agent
+	uint8_t is_http;
+	time_t start_time; // connection start time in milliseconds
+	time_t duration; // duration connection end time in milliseconds
 };
 
 struct hashmap {
@@ -74,23 +78,6 @@ struct connection* hashmap_find(struct hashmap *map, uint32_t saddr,
 	return conn;
 }
 
-// Structure to store packet information
-struct packet_info {
-	u_char src_mac[6];
-	u_char dst_mac[6];
-	u_char src_ip[4];
-	u_char dst_ip[4];
-	u_short src_port;
-	u_short dst_port;
-	char *host;
-	char *user_agent;
-	uint http_request;
-	time_t start_time;
-	u_int8_t protocol;
-};
-
-unsigned int packets_counter;
-
 // Queue to store packet information
 std::queue<struct connection*> packet_queue;
 
@@ -117,19 +104,15 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header,
 		const u_char *packet) {
 
 	struct hashmap *map = (struct hashmap*) args;
-
-	struct iphdr *ip_header = (struct iphdr*) (packet
-			+ sizeof(struct ether_header));
-	struct tcphdr *tcp_header = (struct tcphdr*) (packet
-			+ sizeof(struct ether_header) + (ip_header->ihl * 4));
+	int ethernet_header_size = sizeof(struct ether_header);
+	struct iphdr *ip_header = (struct iphdr*) (packet + ethernet_header_size);
+	struct tcphdr *tcp_header = (struct tcphdr*) (packet + ethernet_header_size
+			+ (ip_header->ihl * 4));
 	uint32_t saddr = ntohl(ip_header->saddr);
 	uint16_t sport = ntohs(tcp_header->source);
 	uint32_t daddr = ntohl(ip_header->daddr);
 	uint16_t dport = ntohs(tcp_header->dest);
-	long long int current_time = time(0);
 	const char *http_payload;
-	int ip_header_size = sizeof(struct ip);
-	int tcp_header_size;
 
 	// check if the packet is a TCP packet
 	if (ip_header->protocol != IPPROTO_TCP) {
@@ -140,7 +123,8 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header,
 	if (tcp_header->syn == 1 && tcp_header->ack == 0) {
 		struct connection conn = { .saddr = saddr, .sport = sport, .daddr =
 				daddr, .dport = dport, .packets_in = 0, .packets_out = 0,
-				.start_time = current_time };
+				.is_http = 0, .start_time = header->ts.tv_sec * 1000 + header->ts.tv_usec / 1000,
+				.duration =0};
 		hashmap_insert(map, &conn);
 	}
 
@@ -157,49 +141,67 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header,
 		conn->packets_in++;
 	}
 
-//	if (conn->dport == 80 || conn->sport == 80) {
-//		// Get TCP header
-//		tcp_header = (struct tcphdr*) (packet + ethernet_header_size
-//				+ ip_header_size);
-//		tcp_header_size = tcp_header->th_off * 4;
-//
-//		// Get HTTP payload
-//		http_payload = (char*) (packet + ethernet_header_size + ip_header_len
-//				+ tcp_header_size);
-//
-//	}
+	if (conn->dport == 80 || conn->sport == 80) {
+		// Get TCP header
+		int tcp_header_size = tcp_header->th_off * 4;
+		int ip_header_size = sizeof(struct ip);
+
+		// Get HTTP payload
+		http_payload = (char*) (packet + ethernet_header_size + ip_header_size
+				+ tcp_header_size);
+
+		char *host = NULL;
+		char *user_agent = NULL;
+
+		// Find Host and User-Agent strings
+		char *start = (char*) strstr((const char*) http_payload, "Host:");
+		if (start) {
+			start += 6;
+			char *end = strchr(start, '\r');
+			if (end) {
+				int size = end - start;
+				host = (char*) malloc(size + 1);
+				strncpy(host, start, size);
+				host[size] = '\0';
+			}
+		}
+
+		start = (char*) strstr((const char*) http_payload, "User-Agent:");
+		if (start) {
+			start += 12;
+			char *end = strchr(start, '\r');
+			if (end) {
+				int size = end - start;
+				user_agent = (char*) malloc(size + 1);
+				strncpy(user_agent, start, size);
+				user_agent[size] = '\0';
+			}
+		}
+
+		if (host != NULL && user_agent != NULL) {
+			conn->is_http = 1;
+			conn->host = host;
+			conn->user_agent = user_agent;
+		}
+	}
 
 	// check if the connection is closed
 	if (tcp_header->fin == 1) {
-		printf(
-				"Connection %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u closed after %d seconds, %d packets in, %d packets out\n",
-				(conn->saddr >> 24) & 0xff, (conn->saddr >> 16) & 0xff,
-				(conn->saddr >> 8) & 0xff, conn->saddr & 0xff, conn->sport,
-				(conn->daddr >> 24) & 0xff, (conn->daddr >> 16) & 0xff,
-				(conn->daddr >> 8) & 0xff, conn->daddr & 0xff, conn->dport,
-				(int) (current_time - conn->start_time), conn->packets_in,
-				conn->packets_out);
 
-		// remove the connection from the hash map
-		conn->saddr = 0;
-		conn->sport = 0;
-		conn->daddr = 0;
-		conn->dport = 0;
-		conn->packets_in = 0;
-		conn->packets_out = 0;
-		conn->start_time = 0;
+		// Calculate duration of connection
+		conn->duration = header->ts.tv_sec * 1000 + header->ts.tv_usec / 1000 - conn->start_time;
+
+		// Lock the queue mutex
+		pthread_mutex_lock(&queue_mutex);
+		// Add the packet information to the queue
+		packet_queue.push(conn);
+
+		// Signal the writing thread that there is data in the queue
+		pthread_cond_signal(&queue_cond);
+
+		// Unlock the queue mutex
+		pthread_mutex_unlock(&queue_mutex);
 	}
-
-	// Lock the queue mutex
-	pthread_mutex_lock(&queue_mutex);
-	// Add the packet information to the queue
-	packet_queue.push(conn);
-
-	// Signal the writing thread that there is data in the queue
-	pthread_cond_signal(&queue_cond);
-
-	// Unlock the queue mutex
-	pthread_mutex_unlock(&queue_mutex);
 
 	if (capture_thread_stop) {
 		pcap_breakloop(handle);
@@ -278,13 +280,16 @@ void* writing_thread_func(void *arg) {
 		pthread_mutex_unlock(&queue_mutex);
 		// Write the packet information to the text file
 		fprintf(fp,
-				"Connection %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u closed after %d seconds, %d packets in, %d packets out\n",
+				"Connection %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u closed after %d milliseconds, %d packets in, %d packets out\n",
 				(conn->saddr >> 24) & 0xff, (conn->saddr >> 16) & 0xff,
 				(conn->saddr >> 8) & 0xff, conn->saddr & 0xff, conn->sport,
 				(conn->daddr >> 24) & 0xff, (conn->daddr >> 16) & 0xff,
 				(conn->daddr >> 8) & 0xff, conn->daddr & 0xff, conn->dport,
-				(int) (time(0) - conn->start_time), conn->packets_in,
+				(int)conn->duration, conn->packets_in,
 				conn->packets_out);
+		if (conn->is_http) {
+			fprintf(fp, "Host: %s\nAgent: %s\n", conn->host, conn->user_agent);
+		}
 		fprintf(fp, "\n");
 	}
 
